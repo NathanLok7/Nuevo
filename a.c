@@ -20,6 +20,7 @@ int *start_all;
 double *res;
 
 sem_t *mutex;
+sem_t *start_sem;
 
 double get_member(int n, double x) {
     int i;
@@ -36,12 +37,13 @@ double get_member(int n, double x) {
 
 void proc(int proc_num) {
     int i;
-    sem_wait(mutex); // Espera al semáforo
+    sem_wait(start_sem); // Espera a que el semáforo de inicio sea liberado
     sums[proc_num] = 0;
     for (i = proc_num; i < SERIES_MEMBER_COUNT; i += NPROCS)
         sums[proc_num] += get_member(i + 1, x);
+    sem_wait(mutex); // Espera al semáforo mutex para actualizar proc_count
     (*proc_count)++;
-    sem_post(mutex); // Libera el semáforo
+    sem_post(mutex); // Libera el semáforo mutex
     exit(0);
 }
 
@@ -49,7 +51,7 @@ void master_proc() {
     int i;
 
     sleep(1);
-    sem_post(start_all); // Libera el semáforo para iniciar el cálculo
+    sem_post(start_sem); // Libera el semáforo de inicio para que los procesos esclavos comiencen
 
     while (*proc_count != NPROCS) {} // Espera a que todos los procesos terminen
 
@@ -76,9 +78,9 @@ int main() {
     shmid = shmget(0x1234, NPROCS * sizeof(double) + 2 * sizeof(int), 0666 | IPC_CREAT);
     shmstart = shmat(shmid, NULL, 0);
     sums = shmstart;
-    proc_count = shmstart + NPROCS * sizeof(double);
-    start_all = shmstart + NPROCS * sizeof(double) + sizeof(int);
-    res = shmstart + NPROCS * sizeof(double) + 2 * sizeof(int);
+    proc_count = (int*)(shmstart + NPROCS * sizeof(double));
+    start_all = (int*)(shmstart + NPROCS * sizeof(double) + sizeof(int));
+    res = (double*)(shmstart + NPROCS * sizeof(double) + 2 * sizeof(int));
 
     *proc_count = 0;
 
@@ -88,8 +90,8 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    start_all = sem_open("/start_all", O_CREAT, S_IRUSR | S_IWUSR, 0); // Crear semáforo start_all
-    if(start_all == SEM_FAILED) {
+    start_sem = sem_open("/start_sem", O_CREAT, S_IRUSR | S_IWUSR, 0); // Crear semáforo de inicio
+    if(start_sem == SEM_FAILED) {
         perror("sem_open failed");
         exit(EXIT_FAILURE);
     }
@@ -124,9 +126,9 @@ int main() {
     shmctl(shmid, IPC_RMID, NULL);
 
     sem_close(mutex); // Cerrar semáforos
-    sem_close(start_all);
+    sem_close(start_sem);
     sem_unlink("/mutex"); // Eliminar semáforos
-    sem_unlink("/start_all");
+    sem_unlink("/start_sem");
 
     return 0;
 }
