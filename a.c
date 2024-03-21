@@ -5,7 +5,9 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/shm.h>
-#include <sys/sem.h>
+#include <semaphore.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #define NPROCS 4
 #define SERIES_MEMBER_COUNT 200000
@@ -17,23 +19,7 @@ int *proc_count;
 int *start_all;
 double *res;
 
-int semid;
-
-union semun {
-    int val;
-    struct semid_ds *buf;
-    unsigned short *array;
-} semopts;
-
-void sem_wait(int semid) {
-    struct sembuf sembuf = {0, -1, SEM_UNDO};
-    semop(semid, &sembuf, 1);
-}
-
-void sem_signal(int semid) {
-    struct sembuf sembuf = {0, 1, SEM_UNDO};
-    semop(semid, &sembuf, 1);
-}
+sem_t *mutex;
 
 double get_member(int n, double x) {
     int i;
@@ -50,37 +36,42 @@ double get_member(int n, double x) {
 
 void proc(int proc_num) {
     int i;
-    sem_wait(semid);
+    sem_wait(mutex); // Espera al semáforo
     sums[proc_num] = 0;
     for (i = proc_num; i < SERIES_MEMBER_COUNT; i += NPROCS)
         sums[proc_num] += get_member(i + 1, x);
-
     (*proc_count)++;
-    sem_signal(semid);
+    sem_post(mutex); // Libera el semáforo
     exit(0);
 }
 
 void master_proc() {
     int i;
+
     sleep(1);
-    *start_all = 1;
+    sem_post(start_all); // Libera el semáforo para iniciar el cálculo
 
-    while (*proc_count != NPROCS) {}
+    while (*proc_count != NPROCS) {} // Espera a que todos los procesos terminen
 
-    sem_wait(semid);
     *res = 0;
     for (i = 0; i < NPROCS; i++)
         *res += sums[i];
-    sem_signal(semid);
 
     exit(0);
 }
 
 int main() {
+    int *threadIdPtr;
+
+    long long start_ts;
+    long long stop_ts;
+    long long elapsed_time;
+    long lElapsedTime;
+    struct timeval ts;
+    int i;
+    int p;
     int shmid;
     void *shmstart;
-    int p;
-    int i;
 
     shmid = shmget(0x1234, NPROCS * sizeof(double) + 2 * sizeof(int), 0666 | IPC_CREAT);
     shmstart = shmat(shmid, NULL, 0);
@@ -89,12 +80,22 @@ int main() {
     start_all = shmstart + NPROCS * sizeof(double) + sizeof(int);
     res = shmstart + NPROCS * sizeof(double) + 2 * sizeof(int);
 
-    semid = semget(IPC_PRIVATE, 1, 0666 | IPC_CREAT);
-    semopts.val = 0;
-    semctl(semid, 0, SETVAL, semopts);
-
     *proc_count = 0;
-    *start_all = 0;
+
+    mutex = sem_open("/mutex", O_CREAT, S_IRUSR | S_IWUSR, 1); // Crear semáforo mutex
+    if(mutex == SEM_FAILED) {
+        perror("sem_open failed");
+        exit(EXIT_FAILURE);
+    }
+
+    start_all = sem_open("/start_all", O_CREAT, S_IRUSR | S_IWUSR, 0); // Crear semáforo start_all
+    if(start_all == SEM_FAILED) {
+        perror("sem_open failed");
+        exit(EXIT_FAILURE);
+    }
+
+    gettimeofday(&ts, NULL);
+    start_ts = ts.tv_sec; // Tiempo inicial
 
     for (i = 0; i < NPROCS; i++) {
         p = fork();
@@ -106,17 +107,26 @@ int main() {
     if (p == 0)
         master_proc();
 
-    for (i = 0; i < NPROCS + 1; i++)
-        wait(NULL);
-
     printf("El recuento de ln(1 + x) miembros de la serie de Mercator es %d\n", SERIES_MEMBER_COUNT);
     printf("El valor del argumento x es %f\n", (double)x);
+
+    for (int i = 0; i < NPROCS + 1; i++)
+        wait(NULL);
+
+    gettimeofday(&ts, NULL);
+    stop_ts = ts.tv_sec; // Tiempo final
+    elapsed_time = stop_ts - start_ts;
+    printf("Tiempo = %lld segundos\n", elapsed_time);
     printf("El resultado es %10.8f\n", *res);
     printf("Llamando a la función ln(1 + %f) = %10.8f\n", x, log(1 + x));
 
     shmdt(shmstart);
     shmctl(shmid, IPC_RMID, NULL);
-    semctl(semid, 0, IPC_RMID, semopts);
-    
+
+    sem_close(mutex); // Cerrar semáforos
+    sem_close(start_all);
+    sem_unlink("/mutex"); // Eliminar semáforos
+    sem_unlink("/start_all");
+
     return 0;
 }
