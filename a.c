@@ -5,7 +5,7 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/shm.h>
-#include <semaphore.h> // Incluimos la librería para semáforos
+#include <sys/sem.h>
 
 #define NPROCS 4
 #define SERIES_MEMBER_COUNT 200000
@@ -14,16 +14,33 @@ double *sums;
 double x = 1.0;
 
 int *proc_count;
-sem_t *start_sem;
-sem_t *finish_sem;
+int *start_all;
 double *res;
+
+int semid;
+
+union semun {
+    int val;
+    struct semid_ds *buf;
+    unsigned short *array;
+} semopts;
+
+void sem_wait(int semid) {
+    struct sembuf sembuf = {0, -1, SEM_UNDO};
+    semop(semid, &sembuf, 1);
+}
+
+void sem_signal(int semid) {
+    struct sembuf sembuf = {0, 1, SEM_UNDO};
+    semop(semid, &sembuf, 1);
+}
 
 double get_member(int n, double x) {
     int i;
     double numerator = 1;
 
-    for (i = 0; i < n; i++)
-        numerator *= x;
+    for(i = 0; i < n; i++)
+        numerator = numerator * x;
 
     if (n % 2 == 0)
         return (-numerator / n);
@@ -33,59 +50,51 @@ double get_member(int n, double x) {
 
 void proc(int proc_num) {
     int i;
-    sem_wait(start_sem); // Espera a que el semáforo de inicio se active
-
+    sem_wait(semid);
     sums[proc_num] = 0;
     for (i = proc_num; i < SERIES_MEMBER_COUNT; i += NPROCS)
         sums[proc_num] += get_member(i + 1, x);
 
-    sem_post(finish_sem); // Indica que el proceso ha terminado su cálculo
+    (*proc_count)++;
+    sem_signal(semid);
     exit(0);
 }
 
 void master_proc() {
     int i;
-
     sleep(1);
-    sem_post(start_sem); // Activamos el semáforo de inicio para permitir que los procesos comiencen
+    *start_all = 1;
 
-    for (i = 0; i < NPROCS; i++)
-        sem_wait(finish_sem); // Esperamos a que todos los procesos terminen sus cálculos
+    while (*proc_count != NPROCS) {}
 
+    sem_wait(semid);
     *res = 0;
     for (i = 0; i < NPROCS; i++)
         *res += sums[i];
+    sem_signal(semid);
 
     exit(0);
 }
 
 int main() {
-    int *threadIdPtr;
-
-    long long start_ts;
-    long long stop_ts;
-    long long elapsed_time;
-    long lElapsedTime;
-    struct timeval ts;
-    int i;
-    int p;
     int shmid;
     void *shmstart;
-
-    // Creamos los semáforos compartidos
-    start_sem = sem_open("/start_sem", O_CREAT | O_EXCL, 0666, 0);
-    finish_sem = sem_open("/finish_sem", O_CREAT | O_EXCL, 0666, 0);
+    int p;
+    int i;
 
     shmid = shmget(0x1234, NPROCS * sizeof(double) + 2 * sizeof(int), 0666 | IPC_CREAT);
     shmstart = shmat(shmid, NULL, 0);
     sums = shmstart;
     proc_count = shmstart + NPROCS * sizeof(double);
+    start_all = shmstart + NPROCS * sizeof(double) + sizeof(int);
     res = shmstart + NPROCS * sizeof(double) + 2 * sizeof(int);
 
-    *proc_count = 0;
+    semid = semget(IPC_PRIVATE, 1, 0666 | IPC_CREAT);
+    semopts.val = 0;
+    semctl(semid, 0, SETVAL, semopts);
 
-    gettimeofday(&ts, NULL);
-    start_ts = ts.tv_sec; // Tiempo inicial
+    *proc_count = 0;
+    *start_all = 0;
 
     for (i = 0; i < NPROCS; i++) {
         p = fork();
@@ -97,25 +106,17 @@ int main() {
     if (p == 0)
         master_proc();
 
-    printf("El recuento de ln(1 + x) miembros de la serie de Mercator es %d\n", SERIES_MEMBER_COUNT);
-    printf("El valor del argumento x es %f\n", (double)x);
-
-    for (int i = 0; i < NPROCS + 1; i++)
+    for (i = 0; i < NPROCS + 1; i++)
         wait(NULL);
 
-    gettimeofday(&ts, NULL);
-    stop_ts = ts.tv_sec; // Tiempo final
-    elapsed_time = stop_ts - start_ts;
-    printf("Tiempo = %lld segundos\n", elapsed_time);
+    printf("El recuento de ln(1 + x) miembros de la serie de Mercator es %d\n", SERIES_MEMBER_COUNT);
+    printf("El valor del argumento x es %f\n", (double)x);
     printf("El resultado es %10.8f\n", *res);
     printf("Llamando a la función ln(1 + %f) = %10.8f\n", x, log(1 + x));
 
-    // Cerramos y eliminamos los semáforos compartidos
-    sem_close(start_sem);
-    sem_close(finish_sem);
-    sem_unlink("/start_sem");
-    sem_unlink("/finish_sem");
-
     shmdt(shmstart);
     shmctl(shmid, IPC_RMID, NULL);
+    semctl(semid, 0, IPC_RMID, semopts);
+    
+    return 0;
 }
